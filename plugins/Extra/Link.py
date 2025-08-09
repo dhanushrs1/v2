@@ -6,18 +6,31 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ForceRepl
 from info import ADMINS, REDIRECT_CHANNEL
 from database.ia_filterdb import get_search_results
 from utils_extra import get_size, formate_file_name
+from database.ia_filterdb import unpack_new_file_id, get_file_details
+
+class TempMedia:
+    def __init__(self, file_id, file_ref, file_name, file_size, mime_type, caption, file_type):
+        self.file_id = file_id
+        self.file_ref = file_ref
+        self.file_name = file_name
+        self.file_size = file_size
+        self.mime_type = mime_type
+        self.caption = caption
+        self.file_type = file_type
 
 # --- State management for multi-admin usage ---
 user_post_data = {}
+# New state for file addition workflow
+user_add_file_state = {}
 
 # --- Lists to identify languages and qualities from filenames ---
 LANGUAGES = [
-    "english", "hindi", "malayalam", "tamil", "telugu", 
+    "english", "hindi", "tulu", "malayalam", "tamil", "telugu", 
     "kannada", "marathi", "bengali", "gujarati", "punjabi"
 ]
 QUALITIES = [
-    "1080p", "720p", "480p", "576p", "WEB-DL", "WEBRip", "HDTV", 
-    "BluRay", "HDRip", "DVDRip", "CAMRip", "HDCAM"
+    "4k","2k","2160p","1440p","1080p", "720p", "480p", "576p", "WEB-DL", "WEBRip", "HDTV", 
+    "BluRay", "HDRip", "DVDRip", "CAMRip","PreDvD","Malti", "HDCAM"
 ]
 
 # --- Helper Functions ---
@@ -114,7 +127,7 @@ async def show_preview(client, chat_id, user_id, message_id=None):
     commands_text += f"• <code>/poster [URL]</code> - Update poster\n"
     commands_text += f"• <code>/info [details]</code> - Update movie info\n"
     commands_text += f"• <code>/button [text|url]</code> - Update button\n"
-    commands_text += f"• <code>/addfile</code> - Add files (reply to file)\n"
+    commands_text += f"• <code>/addfile</code> - Add files (then send file)\n"
     commands_text += f"• <code>/dropfile [number]</code> - Remove file\n"
     commands_text += f"• <code>/listfiles</code> - Show all files\n"
     commands_text += f"• <code>/cancel</code> - Cancel operation\n\n"
@@ -142,6 +155,10 @@ async def show_preview(client, chat_id, user_id, message_id=None):
 def is_in_preview_mode(user_id):
     """Check if user is in preview mode."""
     return user_id in user_post_data
+
+def is_waiting_for_file(user_id):
+    """Check if user is waiting to send a file."""
+    return user_id in user_add_file_state
 
 # --- Main Command ---
 
@@ -347,49 +364,152 @@ async def update_button_command(client, message):
     if preview_msg_id:
         await show_preview(client, message.chat.id, user_id, preview_msg_id)
 
-@Client.on_message(filters.command("addfile") & filters.user(ADMINS) & filters.reply)
+# --- NEW ADDFILE WORKFLOW ---
+
+@Client.on_message(filters.command("addfile") & filters.user(ADMINS))
 async def add_file_command(client, message):
     user_id = message.from_user.id
     
     if not is_in_preview_mode(user_id):
         return await message.reply_text("❌ No active post session. Use <code>/link movie_name</code> first.")
     
-    replied_msg = message.reply_to_message
-    file_obj = None
-    file_name = None
+    # Set the user in "waiting for file" state
+    user_add_file_state[user_id] = {
+        "chat_id": message.chat.id,
+        "timestamp": message.date
+    }
     
-    # Check for different file types
-    if replied_msg.document:
-        file_obj = replied_msg.document
-        file_name = replied_msg.document.file_name
-    elif replied_msg.video:
-        file_obj = replied_msg.video
-        file_name = getattr(replied_msg.video, 'file_name', 'Video File')
-    elif replied_msg.audio:
-        file_obj = replied_msg.audio
-        file_name = getattr(replied_msg.audio, 'file_name', 'Audio File')
+    instruction_text = f"📁 <b>ADD FILE TO POST</b>\n\n"
+    instruction_text += f"📤 <b>Step 1:</b> Send or forward the file you want to add\n"
+    instruction_text += f"🔍 <b>Step 2:</b> Bot will check if file is indexed\n"
+    instruction_text += f"✅ <b>Step 3:</b> File will be added if found in database\n\n"
+    instruction_text += f"⏰ <b>Timeout:</b> 2 minutes\n\n"
+    instruction_text += f"💡 <b>Supported:</b> Documents, Videos, Audio files\n"
+    instruction_text += f"🚫 <b>Cancel:</b> Send /cancel to stop"
     
-    if not file_obj:
-        return await message.reply_text("❌ Please reply to a valid file (document, video, or audio).")
+    await message.reply_text(instruction_text)
     
-    # Check if file already exists
-    existing_files = user_post_data[user_id]["original_files"]
-    file_exists = any(
-        hasattr(f, 'file_id') and f.file_id == file_obj.file_id 
-        for f in existing_files
-    )
+    # Auto-cleanup after 2 minutes
+    asyncio.create_task(cleanup_add_file_state(user_id, 120))
+
+async def cleanup_add_file_state(user_id, delay):
+    """Clean up the add file state after a delay."""
+    await asyncio.sleep(delay)
+    if user_id in user_add_file_state:
+        del user_add_file_state[user_id]
+
+# Handle file messages when user is in "waiting for file" state
+@Client.on_message(
+    (filters.document | filters.video | filters.audio) & 
+    filters.user(ADMINS) & 
+    filters.private
+)
+async def handle_file_for_adding(client, message):
+    user_id = message.from_user.id
     
-    if file_exists:
-        return await message.reply_text("❌ This file is already in the list.")
+    # Check if user is waiting for a file
+    if not is_waiting_for_file(user_id):
+        return  # Don't handle if not in add file mode
     
-    # Add the file
-    user_post_data[user_id]["original_files"].append(file_obj)
-    await message.reply_text(f"✅ Added: {file_name}")
+    # Check if user still has an active session
+    if not is_in_preview_mode(user_id):
+        if user_id in user_add_file_state:
+            del user_add_file_state[user_id]
+        return await message.reply_text("❌ No active post session found.")
     
-    # Update preview
-    preview_msg_id = user_post_data[user_id].get("preview_message_id")
-    if preview_msg_id:
-        await show_preview(client, message.chat.id, user_id, preview_msg_id)
+    processing_msg = await message.reply_text("🔍 <b>Checking file in database...</b>")
+    
+    try:
+        # Get file object
+        file_obj = None
+        if message.document:
+            file_obj = message.document
+        elif message.video:
+            file_obj = message.video
+        elif message.audio:
+            file_obj = message.audio
+        
+        if not file_obj:
+            await processing_msg.edit_text("❌ Invalid file type!")
+            return
+        
+        # Get file details
+        file_name = getattr(file_obj, 'file_name', 'Unknown File')
+        file_size = get_size(file_obj.file_size)
+        
+        # Unpack file ID for database lookup
+        packed_file_id, file_ref = unpack_new_file_id(file_obj.file_id)
+        
+        # Check if file exists in database
+        db_file_details = await get_file_details(packed_file_id)
+        
+        if not db_file_details:
+            error_text = f"❌ <b>FILE NOT INDEXED</b>\n\n"
+            error_text += f"📁 <b>File:</b> {file_name}\n"
+            error_text += f"💾 <b>Size:</b> {file_size}\n\n"
+            error_text += f"⚠️ This file is not in our database.\n"
+            error_text += f"Only indexed files can be added to posts.\n\n"
+            error_text += f"💡 <b>Solution:</b> Make sure the file is forwarded to a channel where the bot indexes files automatically."
+            
+            await processing_msg.edit_text(error_text)
+            
+            # Clean up state
+            if user_id in user_add_file_state:
+                del user_add_file_state[user_id]
+            return
+        
+        # Get the database file object
+        db_file = db_file_details[0]
+        
+        # Check if file is already in the current post
+        existing_files = user_post_data[user_id]["original_files"]
+        file_exists = any(
+            hasattr(f, 'file_id') and f.file_id == packed_file_id
+            for f in existing_files
+        )
+        
+        if file_exists:
+            await processing_msg.edit_text(
+                f"❌ <b>DUPLICATE FILE</b>\n\n"
+                f"📁 This file is already in your movie post.\n\n"
+                f"Use <code>/listfiles</code> to see all added files."
+            )
+            
+            # Clean up state
+            if user_id in user_add_file_state:
+                del user_add_file_state[user_id]
+            return
+        
+        # Add the file to the movie post
+        user_post_data[user_id]["original_files"].append(db_file)
+        
+        # Success message
+        success_text = f"✅ <b>FILE ADDED SUCCESSFULLY</b>\n\n"
+        success_text += f"📁 <b>Name:</b> {formate_file_name(db_file.file_name)}\n"
+        success_text += f"💾 <b>Size:</b> {get_size(db_file.file_size)}\n"
+        success_text += f"🎯 <b>Type:</b> {db_file.file_type.title()}\n\n"
+        success_text += f"📊 <b>Total Files:</b> {len(user_post_data[user_id]['original_files'])}\n\n"
+        success_text += f"💡 Use <code>/addfile</code> again to add more files or <code>/publish</code> to finish."
+        
+        await processing_msg.edit_text(success_text)
+        
+        # Update preview
+        chat_id = user_add_file_state[user_id]["chat_id"]
+        preview_msg_id = user_post_data[user_id].get("preview_message_id")
+        if preview_msg_id:
+            await show_preview(client, chat_id, user_id, preview_msg_id)
+        
+        # Clean up state
+        if user_id in user_add_file_state:
+            del user_add_file_state[user_id]
+            
+    except Exception as e:
+        await processing_msg.edit_text(f"❌ <b>ERROR:</b> {str(e)}")
+        print(f"Error in handle_file_for_adding: {e}")
+        
+        # Clean up state
+        if user_id in user_add_file_state:
+            del user_add_file_state[user_id]
 
 @Client.on_message(filters.command("dropfile") & filters.user(ADMINS))
 async def drop_file_command(client, message):
@@ -458,8 +578,15 @@ async def list_files_command(client, message):
 async def cancel_post_command(client, message):
     user_id = message.from_user.id
     
+    # Cancel add file operation if active
+    if is_waiting_for_file(user_id):
+        del user_add_file_state[user_id]
+        await message.reply_text("❌ <b>ADD FILE CANCELLED</b>\n\nFile addition process stopped.")
+        return
+    
+    # Cancel entire post session
     if not is_in_preview_mode(user_id):
-        return await message.reply_text("❌ No active post session found.")
+        return await message.reply_text("❌ No active session found.")
     
     del user_post_data[user_id]
-    await message.reply_text("❌ <b>OPERATION CANCELLED</b>\n\nUse <code>/link movie_name</code> to start again.")
+    await message.reply_text("❌ <b>POST SESSION CANCELLED</b>\n\nUse <code>/link movie_name</code> to start again.")
